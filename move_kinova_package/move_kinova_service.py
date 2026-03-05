@@ -1,12 +1,19 @@
 import rclpy
 from rclpy.node import Node
+import time
 
 from vision_msgs.msg import Detection3DArray
 from geometry_msgs.msg import PoseStamped
 from std_srvs.srv import Trigger
+from std_srvs.srv import SetBool
+from std_msgs.msg import Float32
 
 from rclpy.action import ActionClient
 from move_kinova_msgs.action import SimpleMove  # <-- replace with your action
+
+from moveit_msgs.msg import PlanningScene, CollisionObject
+from shape_msgs.msg import SolidPrimitive
+from hero_custom_msgs.srv import PickObject, ReleaseObject, SetThreatLevel
 
 import tf2_ros
 import tf2_geometry_msgs
@@ -20,17 +27,34 @@ class GrabServiceNode(Node):
         # ---- Subscriber ----
         self.subscription = self.create_subscription(
             Detection3DArray,
-            '/detections',
+            '/output',
             self.detection_callback,
             10
         )
 
-        # ---- Service ----
-        self.service = self.create_service(
-            Trigger,
-            '/trigger_grab',
-            self.service_callback
+        self.sensor_sub = self.create_subscription(
+            Float32,
+            '/poly5_topic',
+            self.sensor_callback,
+            10
         )
+
+        # ---- Service ----
+        self.grab_service = self.create_service(
+            SetBool,
+            '/trigger_grab',
+            self.grab_service_callback
+        )
+
+        self.release_service = self.create_service(
+            SetBool,
+            '/trigger_release',
+            self.release_service_callback
+        )
+
+        self.pick_object_client = self.create_client(PickObject, '/pick_object')
+        self.release_object_client = self.create_client(ReleaseObject, '/release_object')
+        self.set_threat_client = self.create_client(SetThreatLevel, '/set_threat_level')
 
         # ---- Action Client ----
         self.action_client = ActionClient(
@@ -39,12 +63,21 @@ class GrabServiceNode(Node):
             'grab_object'
         )
 
+        self.planning_scene_publisher = self.create_publisher(
+            PlanningScene,
+            '/planning_scene',
+            10
+        )
+
         # ---- TF Buffer ----
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
+        self.sensor_reading = None
+
         # Storage for latest pose
         self.latest_pose = None
+        self.latest_bbox_size = None
 
     # ==================================================
     # Subscriber
@@ -61,17 +94,26 @@ class GrabServiceNode(Node):
 
         pose = detection.results[0].pose.pose
 
+        # Create a PoseStamped for the bbox center
+        box_pose = PoseStamped()
+        box_pose.header = detection.header
+        box_pose.pose = detection.bbox.center
+
         pose_stamped = PoseStamped()
         pose_stamped.header = detection.header
         pose_stamped.pose = pose
 
         self.latest_pose = pose_stamped
+        self.latest_bbox_size = detection.bbox.size
+
+    def sensor_callback(self, msg: Float32):
+        self.sensor_reading = msg.data
+        #self.get_logger().info(f"Received sensor reading: {self.sensor_reading}")
 
     # ==================================================
     # Service
     # ==================================================
-    def service_callback(self, request, response):
-
+    def grab_service_callback(self, request, response):
         if self.latest_pose is None:
             response.success = False
             response.message = "No detection available"
@@ -83,17 +125,39 @@ class GrabServiceNode(Node):
                 'world',
                 timeout=rclpy.duration.Duration(seconds=1.0)
             )
+            
+            # Update the MoveIt collision environment
+            #self.publish_planning_scene_object(transformed_pose)
+            
+            # Send the goal to the robot
+            self.send_action_goal(transformed_pose)
+
+            response.success = True
+            response.message = "Object added and Grab goal sent"
+
+
         except Exception as e:
-            self.get_logger().error(str(e))
+            self.get_logger().error(f"Failed: {str(e)}")
             response.success = False
-            response.message = "TF transform failed"
+            response.message = "Error in processing"
+            
+        return response
+
+    def release_service_callback(self, request, response):
+        try:
+            # For demonstration, let's just log the release action
+            self.get_logger().info("Release service called")
+            self.send_release_action_goal()  # Implement this method to send a release command to the robot
+        except Exception as e:
+            self.get_logger().error(f"Release failed: {str(e)}")
+            response.success = False
+            response.message = "Error in release"
             return response
 
-        self.send_action_goal(transformed_pose)
-
         response.success = True
-        response.message = "Grab goal sent"
+        response.message = "Release triggered"
         return response
+
 
     # ==================================================
     # Action
@@ -104,17 +168,26 @@ class GrabServiceNode(Node):
             self.get_logger().error("Action server not available")
             return
 
-        goal_msg = SimpleMove.Goal()
+        pick_msg = SimpleMove.Goal()
 
         # Your action expects geometry_msgs/Pose
-        goal_msg.target_pose = pose_stamped.pose
+        pick_msg.target_pose = pose_stamped.pose
+
+        pick_msg.target_pose.position.x -= 0.1 # hacky way to not colide with the object
+
+        pick_msg.target_pose.orientation.x = 0.707
+        pick_msg.target_pose.orientation.y = 0.0
+        pick_msg.target_pose.orientation.z = 0.707
+        pick_msg.target_pose.orientation.w = 0.0
+        pick_msg.move_gripper = 1
 
         send_goal_future = self.action_client.send_goal_async(
-            goal_msg,
+            pick_msg,
             feedback_callback=self.feedback_callback
         )
 
         send_goal_future.add_done_callback(self.goal_response_callback)
+
 
     def goal_response_callback(self, future):
         goal_handle = future.result()
@@ -131,10 +204,206 @@ class GrabServiceNode(Node):
     def result_callback(self, future):
         result = future.result().result
         self.get_logger().info(f"Result success: {result.success}")
+        self.remove_object_from_scene('detected_object')
+
+        request = PickObject.Request()
+        response = PickObject.Response()
+        request.id = 1000 # Placeholder ID, adjust as needed
+        if result.success:
+            response.success = True
+            response.message = "Object picked successfully"
+            self.pick_object_client.call_async(request)
+            time.sleep(4)
+            self.send_sniff_action_goal()
+        else:
+            response.success = False
+            response.message = "Failed to pick object"
+            self.pick_object_client.call_async(request)
 
     def feedback_callback(self, feedback_msg):
         feedback = feedback_msg.feedback
         self.get_logger().info(f"Status: {feedback.status}")
+
+    #---------------sniff action----------------
+
+
+    def send_sniff_action_goal(self):
+        sniff_msg = SimpleMove.Goal()
+        sniff_msg.target_pose.position.x = -0.02
+        sniff_msg.target_pose.position.y = -0.35
+        sniff_msg.target_pose.position.z = 0.1
+        sniff_msg.target_pose.orientation.x = 0.0
+        sniff_msg.target_pose.orientation.y = -0.707
+        sniff_msg.target_pose.orientation.z = 0.0
+        sniff_msg.target_pose.orientation.w = 0.707
+        sniff_msg.move_gripper = 0
+
+        send_sniff_future = self.action_client.send_goal_async(
+            sniff_msg,
+            feedback_callback=self.sniff_feedback_callback
+        )
+
+        send_sniff_future.add_done_callback(self.sniff_response_callback)
+        
+    def sniff_response_callback(self, future):
+        goal_handle = future.result()
+
+        if not goal_handle.accepted:
+            self.get_logger().info("Sniff goal rejected")
+            return
+
+        self.get_logger().info("Sniff goal accepted")
+
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.sniff_result_react)
+
+    def sniff_result_react(self, future):
+        result = future.result().result
+        self.get_logger().info(f"Result success: {result.success}")
+        time.sleep(60)  # Wait for sensor reading to update
+        threat_request = SetThreatLevel.Request()
+        threat_request.sensor_value = self.sensor_reading  # Example threat level
+        self.set_threat_client.call_async(threat_request)
+        self.get_logger().info(f"Sensor reading at sniff: {self.sensor_reading}")
+        self.return_home_action_goal()
+
+
+    def sniff_feedback_callback(self, feedback_msg):
+        feedback = feedback_msg.feedback
+        self.get_logger().info(f"Status: {feedback.status}")
+
+    #---------------return home action----------------
+
+    def return_home_action_goal(self):
+        home_msg = SimpleMove.Goal()
+        home_msg.target_pose.position.x = 0.2
+        home_msg.target_pose.position.y = 0.0
+        home_msg.target_pose.position.z = 0.5
+        home_msg.target_pose.orientation.x = 0.707
+        home_msg.target_pose.orientation.y = 0.0
+        home_msg.target_pose.orientation.z = 0.707
+        home_msg.target_pose.orientation.w = 0.0
+        home_msg.move_gripper = 0
+
+        send_home_future = self.action_client.send_goal_async(
+            home_msg,
+            feedback_callback=self.home_feedback_callback
+        )
+
+        send_home_future.add_done_callback(self.home_response_callback)
+
+    def home_response_callback(self, future):
+        goal_handle = future.result()
+
+        if not goal_handle.accepted:
+            self.get_logger().info("Home goal rejected")
+            return
+
+        self.get_logger().info("Home goal accepted")
+
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.home_result_callback)
+
+    def home_result_callback(self, future):
+        result = future.result().result
+        self.get_logger().info(f"Returned home, success: {result.success}")
+
+    def home_feedback_callback(self, feedback_msg):
+        feedback = feedback_msg.feedback
+        self.get_logger().info(f"Status: {feedback.status}")
+
+
+    #---------------release action----------------
+
+    def send_release_action_goal(self):
+        release_msg = SimpleMove.Goal()
+        release_msg.target_pose.position.x = 0.4
+        release_msg.target_pose.position.y = 0.1
+        release_msg.target_pose.position.z = -0.2
+        release_msg.target_pose.orientation.x = 0.866
+        release_msg.target_pose.orientation.y = 0.0
+        release_msg.target_pose.orientation.z = 0.5
+        release_msg.target_pose.orientation.w = 0.0
+        release_msg.move_gripper = 2  # Custom flag to indicate release
+
+        send_release_future = self.action_client.send_goal_async(
+            release_msg,
+            feedback_callback=self.release_feedback_callback
+        )
+
+        send_release_future.add_done_callback(self.release_response_callback)
+
+    def release_response_callback(self, future):
+        goal_handle = future.result()
+
+        if not goal_handle.accepted:
+            self.get_logger().info("Release goal rejected")
+            return
+
+        self.get_logger().info("Release goal accepted")
+
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.release_result_callback)
+
+    def release_result_callback(self, future):
+        result = future.result().result
+        self.get_logger().info(f"Release action completed, success: {result.success}")
+        time.sleep(2)  # Wait for any final movements to complete
+        release_request = ReleaseObject.Request()
+        release_request.id = 1000 # Placeholder ID, adjust as needed
+        release_response = ReleaseObject.Response()
+        release_response.success = result.success
+        release_response.message = "Object released" if result.success else "Failed to release object"
+        self.release_object_client.call_async(release_request)  # Notify that release is done
+        self.return_home_action_goal()
+
+    def release_feedback_callback(self, feedback_msg):
+        feedback = feedback_msg.feedback
+        self.get_logger().info(f"Status: {feedback.status}")
+    
+
+
+    # ==================================================
+    # Publisher for Planning Scene (to add detected object as collision object)
+    # ==================================================
+
+    def publish_planning_scene_object(self, transformed_pose):
+        collision_object = CollisionObject()
+        collision_object.header.frame_id = 'world'
+        collision_object.id = 'detected_object'
+        
+        # Define the box shape
+        box = SolidPrimitive()
+        box.type = SolidPrimitive.BOX
+        box.dimensions = [
+            self.latest_bbox_size.x/3, 
+            self.latest_bbox_size.y,  ## y is height for some reason, so we keep it as is
+            self.latest_bbox_size.z/3
+        ]
+
+        collision_object.primitives.append(box)
+        collision_object.primitive_poses.append(transformed_pose.pose)
+        collision_object.operation = CollisionObject.ADD
+
+        # Wrap in PlanningScene message
+        planning_scene_msg = PlanningScene()
+        planning_scene_msg.world.collision_objects.append(collision_object)
+        planning_scene_msg.is_diff = True # Crucial: only adds the change
+        
+        self.planning_scene_publisher.publish(planning_scene_msg)
+        self.get_logger().info("Object added to planning scene.")
+
+    def remove_object_from_scene(self, object_id='detected_object'):
+        collision_object = CollisionObject()
+        collision_object.id = object_id
+        collision_object.operation = CollisionObject.REMOVE
+
+        planning_scene_msg = PlanningScene()
+        planning_scene_msg.world.collision_objects.append(collision_object)
+        planning_scene_msg.is_diff = True
+        
+        self.planning_scene_publisher.publish(planning_scene_msg)
+        self.get_logger().info(f"Object '{object_id}' removed from planning scene.")
 
     # ==================================================
     # Main
