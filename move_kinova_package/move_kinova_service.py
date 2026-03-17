@@ -52,6 +52,12 @@ class GrabServiceNode(Node):
             self.release_service_callback
         )
 
+        self.place_back_service = self.create_service(
+            SetBool,
+            '/trigger_place_back',
+            self.place_back_service_callback
+        )
+
         self.pick_object_client = self.create_client(PickObject, '/pick_object')
         self.release_object_client = self.create_client(ReleaseObject, '/release_object')
         self.set_threat_client = self.create_client(SetThreatLevel, '/set_threat_level')
@@ -78,6 +84,8 @@ class GrabServiceNode(Node):
         # Storage for latest pose
         self.latest_pose = None
         self.latest_bbox_size = None
+
+        self.picked_pose = None
 
     # ==================================================
     # Subscriber
@@ -106,6 +114,7 @@ class GrabServiceNode(Node):
         self.latest_pose = pose_stamped
         self.latest_bbox_size = detection.bbox.size
 
+
     def sensor_callback(self, msg: Float32):
         self.sensor_reading = msg.data
         #self.get_logger().info(f"Received sensor reading: {self.sensor_reading}")
@@ -127,13 +136,16 @@ class GrabServiceNode(Node):
             )
             
             # Update the MoveIt collision environment
-            #self.publish_planning_scene_object(transformed_pose)
+            self.remove_object_from_scene("table_obstacle")  # Clear previous object if exists
+            self.publish_planning_scene_object(transformed_pose)
+            self.publish_table_as_obstacle(transformed_pose)
             
             # Send the goal to the robot
             self.send_action_goal(transformed_pose)
 
             response.success = True
             response.message = "Object added and Grab goal sent"
+            self.picked_pose = transformed_pose  # Store the pose for later use
 
 
         except Exception as e:
@@ -158,6 +170,22 @@ class GrabServiceNode(Node):
         response.message = "Release triggered"
         return response
 
+    def place_back_service_callback(self, request, response):
+        try:
+            self.publish_table_as_obstacle(self.picked_pose)  # Re-add the table obstacle to the planning scene
+            self.get_logger().info("Place back service called")
+            self.send_place_back_action_goal(self.picked_pose)
+              # Implement this method to send a command to move back to home position
+        except Exception as e:
+            self.get_logger().error(f"Place back failed: {str(e)}")
+            response.success = False
+            response.message = "Error in placing back"
+            return response
+
+        response.success = True
+        response.message = "Place back triggered"
+        return response
+
 
     # ==================================================
     # Action
@@ -167,6 +195,10 @@ class GrabServiceNode(Node):
         if not self.action_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().error("Action server not available")
             return
+
+        #self.send_action_above_goal(pose_stamped)  # Move above the object first
+
+        #time.sleep(1)  # Wait for the robot to move above the object
 
         pick_msg = SimpleMove.Goal()
 
@@ -185,6 +217,9 @@ class GrabServiceNode(Node):
             pick_msg,
             feedback_callback=self.feedback_callback
         )
+
+        #self.send_action_above_goal(pose_stamped)  # Move above the object first
+        #time.sleep(1)  # Wait for the robot to move above the object
 
         send_goal_future.add_done_callback(self.goal_response_callback)
 
@@ -206,6 +241,9 @@ class GrabServiceNode(Node):
         self.get_logger().info(f"Result success: {result.success}")
         self.remove_object_from_scene('detected_object')
 
+        self.return_home_action_goal()  # Move back to home position after picking
+        time.sleep(4)  # Wait for the robot to move back home
+
         request = PickObject.Request()
         response = PickObject.Response()
         request.id = 1000 # Placeholder ID, adjust as needed
@@ -223,6 +261,34 @@ class GrabServiceNode(Node):
     def feedback_callback(self, feedback_msg):
         feedback = feedback_msg.feedback
         self.get_logger().info(f"Status: {feedback.status}")
+
+    # --------------move above object action----------------
+
+    def send_action_above_goal(self, pose_stamped):
+
+        if not self.action_client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().error("Action server not available")
+            return
+
+        pick_msg = SimpleMove.Goal()
+
+        # Your action expects geometry_msgs/Pose
+        pick_msg.target_pose = pose_stamped.pose
+
+        pick_msg.target_pose.position.x -= 0.1 # hacky way to not colide with the object
+        pick_msg.target_pose.position.z += 0.1 # Move above the object
+
+        pick_msg.target_pose.orientation.x = 0.707
+        pick_msg.target_pose.orientation.y = 0.0
+        pick_msg.target_pose.orientation.z = 0.707
+        pick_msg.target_pose.orientation.w = 0.0
+        pick_msg.move_gripper = 0
+
+        send_goal_future = self.action_client.send_goal_async(
+            pick_msg,
+            feedback_callback=self.feedback_callback
+        )
+
 
     #---------------sniff action----------------
 
@@ -260,11 +326,12 @@ class GrabServiceNode(Node):
     def sniff_result_react(self, future):
         result = future.result().result
         self.get_logger().info(f"Result success: {result.success}")
-        time.sleep(60)  # Wait for sensor reading to update
+        time.sleep(10)  # Wait for sensor reading to update
         threat_request = SetThreatLevel.Request()
         threat_request.sensor_value = self.sensor_reading  # Example threat level
         self.set_threat_client.call_async(threat_request)
         self.get_logger().info(f"Sensor reading at sniff: {self.sensor_reading}")
+        self.remove_object_from_scene('table_obstacle')
         self.return_home_action_goal()
 
 
@@ -360,7 +427,58 @@ class GrabServiceNode(Node):
     def release_feedback_callback(self, feedback_msg):
         feedback = feedback_msg.feedback
         self.get_logger().info(f"Status: {feedback.status}")
-    
+
+
+    #-----------------place back action----------------
+
+    def send_place_back_action_goal(self, pose_stamped):
+
+        if not self.action_client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().error("Action server not available")
+            return
+
+        #self.send_action_above_goal(pose_stamped)  # Move above the object first
+
+        #time.sleep(1)  # Wait for the robot to move above the object
+
+        pick_msg = SimpleMove.Goal()
+
+        # Your action expects geometry_msgs/Pose
+        pick_msg.target_pose = pose_stamped.pose
+
+
+        pick_msg.target_pose.orientation.x = 0.707
+        pick_msg.target_pose.orientation.y = 0.0
+        pick_msg.target_pose.orientation.z = 0.707
+        pick_msg.target_pose.orientation.w = 0.0
+        pick_msg.move_gripper = 2
+
+        send_goal_future = self.action_client.send_goal_async(
+            pick_msg,
+            feedback_callback=self.feedback_callback
+        )
+
+        #self.send_action_above_goal(pose_stamped)  # Move above the object first
+        #time.sleep(1)  # Wait for the robot to move above the object
+
+        send_goal_future.add_done_callback(self.goal_place_back_response_callback)
+
+    def goal_place_back_response_callback(self, future):
+        goal_handle = future.result()
+
+        if not goal_handle.accepted:
+            self.get_logger().info("Place back goal rejected")
+            return
+
+        self.get_logger().info("Place back goal accepted")
+
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.place_back_result_callback)
+
+    def place_back_result_callback(self, future):
+        result = future.result().result
+        self.get_logger().info(f"Place back completed, success: {result.success}")
+        self.return_home_action_goal()  # Move back to home position after placing back
 
 
     # ==================================================
@@ -376,12 +494,13 @@ class GrabServiceNode(Node):
         box = SolidPrimitive()
         box.type = SolidPrimitive.BOX
         box.dimensions = [
-            self.latest_bbox_size.x/3, 
+            self.latest_bbox_size.x/4, 
             self.latest_bbox_size.y,  ## y is height for some reason, so we keep it as is
-            self.latest_bbox_size.z/3
+            self.latest_bbox_size.z/4
         ]
 
         collision_object.primitives.append(box)
+        transformed_pose.pose.position.y -= 0.05
         collision_object.primitive_poses.append(transformed_pose.pose)
         collision_object.operation = CollisionObject.ADD
 
@@ -392,6 +511,38 @@ class GrabServiceNode(Node):
         
         self.planning_scene_publisher.publish(planning_scene_msg)
         self.get_logger().info("Object added to planning scene.")
+
+    def publish_table_as_obstacle(self, transformed_pose):
+        collision_object = CollisionObject()
+        collision_object.header.frame_id = 'world'
+        collision_object.id = 'table_obstacle'
+        
+        # Define the box shape for the table
+        box = SolidPrimitive()
+        box.type = SolidPrimitive.BOX
+        box.dimensions = [0.15, 0.15, 0.01]  # Example dimensions for the table
+
+        collision_object.primitives.append(box)
+        
+        # Position the table at the transformed pose (adjust as needed)
+        table_pose = PoseStamped()
+        table_pose.header.frame_id = 'world'
+        table_pose.pose.position.x = transformed_pose.pose.position.x
+        table_pose.pose.position.y = transformed_pose.pose.position.y
+        table_pose.pose.position.z = transformed_pose.pose.position.z - 0.1  # Slightly below the object
+        table_pose.pose.orientation.w = 1.0  # No rotation
+
+        collision_object.primitive_poses.append(table_pose.pose)
+        collision_object.operation = CollisionObject.ADD
+
+        # Wrap in PlanningScene message
+        planning_scene_msg = PlanningScene()
+        planning_scene_msg.world.collision_objects.append(collision_object)
+        planning_scene_msg.is_diff = True
+        
+        self.planning_scene_publisher.publish(planning_scene_msg)
+        self.get_logger().info("Table obstacle added to planning scene.")
+
 
     def remove_object_from_scene(self, object_id='detected_object'):
         collision_object = CollisionObject()
