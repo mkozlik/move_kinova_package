@@ -10,25 +10,25 @@ import asyncio
 
 from moveit_msgs.msg import PlanningScene, CollisionObject
 from shape_msgs.msg import SolidPrimitive
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose, Quaternion
 from hero_custom_msgs.srv import PickObject, ReleaseObject
 
 
 class KinovaBridge(Node):
     def __init__(self):
         super().__init__('kinova_bridge_node')
-        
+
         # Client to talk to MoveIt's internal action
         self._moveit_client = ActionClient(self, MoveGroup, '/move_action')
         self.gripper_client = ActionClient(self, GripperCommand, '/gen3_lite_2f_gripper_controller/gripper_cmd')
         self.planning_scene_publisher = self.create_publisher(PlanningScene, '/planning_scene', 10)
         self.grab_service_client = self.create_client(PickObject, '/pick_object')
 
-        
+
         # Server for your simplified terminal command
         self._action_server = ActionServer(
             self, SimpleMove, 'grab_object', self.execute_callback)
-        
+
         self.get_logger().info("Kinova Bridge Node is online.")
 
 
@@ -39,11 +39,11 @@ class KinovaBridge(Node):
         collision_object.header.frame_id = "world"
         collision_object.primitives = []
         collision_object.primitive_poses = []
-        
+
         box = SolidPrimitive()
         box.type = SolidPrimitive.BOX
         box.dimensions = [
-            size_x, 
+            size_x,
             size_y,
             size_z
         ]
@@ -53,16 +53,31 @@ class KinovaBridge(Node):
         pose.position.z = pos_z
         collision_object.primitives.append(box)
         collision_object.primitive_poses.append(pose)
-        
+
         # Publish the collision object to the planning scene
         planning_scene_msg = PlanningScene()
         planning_scene_msg.world.collision_objects.append(collision_object)
         planning_scene_msg.is_diff = True # Crucial: only adds the change
-        
+
         self.planning_scene_publisher.publish(planning_scene_msg)
 
+    def delete_object_from_scene(self, object_id):
+        # Delete an object from the planning scene
+        collision_object = CollisionObject()
+        collision_object.id = object_id
+        collision_object.header.frame_id = "world"
+        collision_object.operation = CollisionObject.REMOVE
+
+        # Publish the deletion request
+        planning_scene_msg = PlanningScene()
+        planning_scene_msg.world.collision_objects.append(collision_object)
+        planning_scene_msg.is_diff = True
+
+        self.planning_scene_publisher.publish(planning_scene_msg)
+        self.get_logger().info(f"Deleted object '{object_id}' from planning scene.")
+
     async def execute_callback(self, goal_handle):
-        pos_x = -0.345
+        pos_x = 0.345
         pos_y = 0.0
         pos_z = 0.09
 
@@ -71,7 +86,7 @@ class KinovaBridge(Node):
         size_z = 0.18
         self.setup_scene_collisions(pos_x, pos_y, pos_z, size_x, size_y, size_z, name="sensor_box")
 
-        pos_x = 0.125
+        pos_x = -0.125
         pos_y = 0.0
         pos_z = 0.04
 
@@ -80,9 +95,30 @@ class KinovaBridge(Node):
         size_z = 0.08
         self.setup_scene_collisions(pos_x, pos_y, pos_z, size_x, size_y, size_z, name="lidar")
 
+        pos_x = 0.15
+        pos_y = 0.0
+        pos_z = -0.15
+        size_x = 0.730
+        size_y = 0.520
+        size_z = 0.30
+        self.setup_scene_collisions(pos_x, pos_y, pos_z, size_x, size_y, size_z, name="ranger")
+
         target = goal_handle.request.target_pose
         gripper_command = goal_handle.request.move_gripper
-        
+        object_attached = goal_handle.request.object_attached
+
+        # Add object as obstacle so the planner avoids colliding with it
+        if not object_attached:
+            self.setup_scene_collisions(
+                target.position.x-0.1,
+                target.position.y,
+                target.position.z,
+                0.02,
+                0.02,
+                1.0,
+                name="target_object"
+            )
+
         # 1. Wait for MoveIt
         if not self._moveit_client.wait_for_server(timeout_sec=5.0):
             goal_handle.abort()
@@ -91,23 +127,30 @@ class KinovaBridge(Node):
         # 2. Build the complex MoveGroup goal
         goal_msg = MoveGroup.Goal()
         goal_msg.request.group_name = "arm"
+
+        goal_msg.request.pipeline_id = "pilz_industrial_motion_planner"
+        goal_msg.request.planner_id = "PTP"
+        goal_msg.request.max_velocity_scaling_factor = 0.7
+        goal_msg.request.max_acceleration_scaling_factor = 0.7
+
         
+
         # Position Constraint
         pos_con = PositionConstraint()
         pos_con.header.frame_id = "world"
         pos_con.link_name = "end_effector_link" # Verify this name!
-        
+
         box = SolidPrimitive()
         box.type = SolidPrimitive.BOX
         box.dimensions = [0.001, 0.001, 0.001]
-        
+
         volume = BoundingVolume()
         volume.primitives.append(box)
         volume.primitive_poses.append(target)
-        
+
         pos_con.constraint_region = volume
         pos_con.weight = 1.0
-        
+
         # Orientation Constraint
         ori_con = OrientationConstraint()
         ori_con.header.frame_id = "world"
@@ -117,16 +160,63 @@ class KinovaBridge(Node):
         ori_con.absolute_y_axis_tolerance = 0.1
         ori_con.absolute_z_axis_tolerance = 0.1
         ori_con.weight = 1.0
-        
+
         goal_msg.request.goal_constraints.append(Constraints(
-            position_constraints=[pos_con], 
+            position_constraints=[pos_con],
             orientation_constraints=[ori_con]
         ))
+
+        path_constraints = Constraints()
+        orient_constraint = OrientationConstraint()
+        orient_constraint.header.frame_id = "world"
+        orient_constraint.link_name = "end_effector_link"
+
+        # Add smooth forward motion constraint
+        forward_constraint = PositionConstraint()
+        forward_constraint.header.frame_id = "world"
+        forward_constraint.link_name = "end_effector_link"
+
+        # Allow small lateral deviation but tight vertical constraint for smooth forward motion
+        box_forward = SolidPrimitive()
+        box_forward.type = SolidPrimitive.BOX
+        box_forward.dimensions = [1.5, 0.5, 0.3]  # Large forward, tight side-to-side
+
+        volume_forward = BoundingVolume()
+        volume_forward.primitives.append(box_forward)
+        volume_forward.primitive_poses.append(target)
+
+        forward_constraint.constraint_region = volume_forward
+        forward_constraint.weight = 0.5
+        path_constraints.position_constraints.append(forward_constraint)
+
+
+        if object_attached:
+            # Desired upright orientation (z axis up)
+            orient_constraint.orientation = Quaternion(
+                x=0.707,
+                y=0.0,
+                z=0.707,
+                w=0.0,
+            )
+
+            # Tight roll/pitch, free yaw
+            orient_constraint.absolute_x_axis_tolerance = 3.14
+            orient_constraint.absolute_y_axis_tolerance = 1.50
+            orient_constraint.absolute_z_axis_tolerance = 1.50
+
+            orient_constraint.weight = 1.0
+
+            path_constraints.orientation_constraints.append(orient_constraint)
+
+            goal_msg.request.path_constraints = path_constraints
+
+        goal_msg.request.num_planning_attempts = 30
+        goal_msg.request.allowed_planning_time = 10.0
 
         # 3. Send and Wait
         self.get_logger().info("Sending goal to MoveIt...")
         send_goal_future = await self._moveit_client.send_goal_async(goal_msg)
-        
+
         if not send_goal_future.accepted:
             goal_handle.abort()
             return SimpleMove.Result(success=False)
@@ -172,7 +262,7 @@ class KinovaBridge(Node):
             closed_position = gripper_result.position
             self.get_logger().info(f"Gripper closed to position: {closed_position}")
 
-            if closed_position > 0.65:
+            if closed_position > 0.75:
                 self.get_logger().warn("No object detected. Re-opening gripper...")
 
                 open_goal = GripperCommand.Goal()
@@ -180,9 +270,11 @@ class KinovaBridge(Node):
                 open_goal.command.max_effort = 50.0
 
                 await self.gripper_client.send_goal_async(open_goal)
-                
+
                 goal_handle.abort()
                 return SimpleMove.Result(success=False)
+
+            self.delete_object_from_scene("target_object")  # Remove the object from the planning scene since it's now attached
 
             self.get_logger().info("Object successfully grasped!")
 
@@ -208,7 +300,7 @@ class KinovaBridge(Node):
                 return SimpleMove.Result(success=False)
 
             self.get_logger().info("Object released.")
-            
+
         goal_handle.succeed()
         return SimpleMove.Result(success=True)
 

@@ -13,6 +13,7 @@ from std_msgs.msg import Float32, String, Int32
 from rclpy.action import ActionClient
 from rclpy.executors import MultiThreadedExecutor
 from move_kinova_msgs.action import SimpleMove  
+from sensor_msgs.msg import JointState
 
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from control_msgs.action import GripperCommand
@@ -57,9 +58,9 @@ class SensorReaderNode(Node):
         #self.get_logger().info(f"Received sensor reading: {sensor_reading}")
 
 
-class KinovaActionNode(Node):
+class KinovaStateMachineNode(Node):
     def __init__(self):
-        super().__init__('kinova_action_node')
+        super().__init__('kinova_state_machine_node')
 
         # ---- Subscriber ----
         self.subscription = self.create_subscription(
@@ -80,6 +81,13 @@ class KinovaActionNode(Node):
             String,
             '/current_object',
             self.object_callback,
+            10
+        )
+
+        self.joint_state_subscription = self.create_subscription(
+            JointState,
+            '/joint_states',
+            self.joint_state_callback,
             10
         )
 
@@ -105,6 +113,12 @@ class KinovaActionNode(Node):
             self.grab_service_callback
         )
 
+        self.place_back_service = self.create_service(
+            SetBool,
+            '/trigger_place_back',
+            self.place_back_service_callback
+        )
+
         self.pick_object_client = self.create_client(PickObject, '/unity_pick_object')
         self.pouch_object_client = self.create_client(SetBool, '/unity_pouch_object')
         self.place_back_client = self.create_client(SetBool, '/unity_place_back_object')
@@ -112,7 +126,11 @@ class KinovaActionNode(Node):
         self.robot_joint_publisher = self.create_publisher(JointTrajectory, '/joint_trajectory_controller/joint_trajectory', 10)
 
         # ---- Action Client ----
-        self._moveit_client = ActionClient(self, MoveGroup, '/move_action')
+        self.action_client = ActionClient(
+            self,
+            SimpleMove,
+            'grab_object'
+        )
 
         self.planning_scene_publisher = self.create_publisher(
             PlanningScene,
@@ -133,12 +151,15 @@ class KinovaActionNode(Node):
         self.picked_pose = None
         self.latest_detection = None
         self.picking_object = True
-        self.state = States.IDLE
+        self.state = States.HOMING
         self.state_transitioned = True
         self.pouch_pressed = False
         self.grab_pressed = False
         self.sniff_pressed = False
+        self.place_back_pressed = False
         self.clock = 0.0
+        self.grab_done = False
+        self.grab_succeeded = False
 
         # read poses from yaml
         yaml_path = Path(__file__).parent / 'config' / 'robot_poses.yaml' # in config folder
@@ -146,12 +167,27 @@ class KinovaActionNode(Node):
             self.predefined_poses = yaml.safe_load(file)
             print(f"Loaded predefined poses: {self.predefined_poses.get('home', 'Not found').get('joint', 'Not found')[:3]}")
 
+        home_joints = self.predefined_poses['home']['joint']
+        traj_msg = JointTrajectory()
+        traj_msg.joint_names = [f'joint_{i+1}' for i in range(len(home_joints))]
+        point = JointTrajectoryPoint()
+        point.positions = home_joints
+        point.time_from_start = rclpy.duration.Duration(seconds=3).to_msg()
+        traj_msg.points.append(point)
+        self.robot_joint_publisher.publish(traj_msg)
+
+
+    def joint_state_callback(self, msg: JointState):
+        # Save latest joint states if needed for feedback or state estimation
+        self.latest_joint_states = msg
+        pass
+
 
     def object_point_callback(self, msg: PointStamped):
         self.latest_pose = msg
         try:
             # Transform the point to the robot's base frame but point itself cannot be tranformed, so we create a PoseStamped with the point as the position and a default orientation
-            pose_msg = Pose()
+            pose_msg = PoseStamped()
             pose_msg.header = msg.header
 
             pose_msg.pose.position.x = msg.point.x
@@ -180,6 +216,10 @@ class KinovaActionNode(Node):
 
 
     def pouch_service_callback(self, request, response):
+        if self.state != States.HOMING:
+            response.success = False
+            response.message = "Cannot pouch: Robot not in HOMING state"
+            return response
         try:
             # For demonstration, let's just log the release action
             self.get_logger().info("Pouch service called")
@@ -195,6 +235,10 @@ class KinovaActionNode(Node):
         return response
 
     def sniff_service_callback(self, request, response):
+        if self.state != States.HOMING:
+            response.success = False
+            response.message = "Cannot sniff: Robot not in HOMING state"
+            return response
         try:
             # For demonstration, let's just log the sniff action
             self.get_logger().info("Sniff service called")
@@ -210,6 +254,10 @@ class KinovaActionNode(Node):
         return response
 
     def grab_service_callback(self, request, response):
+        if self.state != States.IDLE:
+            response.success = False
+            response.message = "Cannot grab: Robot not in IDLE state"
+            return response
         try:
             self.get_logger().info("Grab service called")
             self.grab_pressed = True  # Set the flag to trigger grabbing in the state machine
@@ -221,6 +269,24 @@ class KinovaActionNode(Node):
 
         response.success = True
         response.message = "Grab triggered"
+        return response
+
+    def place_back_service_callback(self, request, response):
+        if self.state != States.HOMING:
+            response.success = False
+            response.message = "Cannot place back: Robot not in HOMING state"
+            return response
+        try:
+            self.get_logger().info("Place back service called")
+            self.place_back_pressed = True  # Set the flag to trigger placing back in the state machine
+        except Exception as e:
+            self.get_logger().error(f"Place back failed: {str(e)}")
+            response.success = False
+            response.message = "Error in place back"
+            return response
+
+        response.success = True
+        response.message = "Place back triggered"
         return response
 
 
@@ -261,40 +327,6 @@ class KinovaActionNode(Node):
         self.latest_object_string = msg.data
         #print(f"latest object id from topic: {self.latest_object_id}")
 
-    def object_pickup(self, pose):
-        if not self._moveit_client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error("MoveIt action server not available!")
-            return
-        self.get_logger().info("Sending goal to MoveIt...")
-        goal_msg = MoveGroup.Goal()
-        goal_msg.request.group_name = "arm"
-        # Set the target pose for the end effector where end effector is with fixed orientation, only position is from the detection
-        goal_msg.request.goal_constraints.append(Constraints())
-        goal_msg.request.goal_constraints[0].position_constraints.append(PositionConstraint())
-        pos_constraint = goal_msg.request.goal_constraints[0].position_constraints[0]
-        pos_constraint.header.frame_id = "world"
-        pos_constraint.link_name = "end_effector_link"
-        pos_constraint.constraint_region.primitives.append(SolidPrimitive())
-        pos_constraint.constraint_region.primitives[0].type = SolidPrimitive.BOX
-        pos_constraint.constraint_region.primitives[0].dimensions = [0.001, 0.001, 0.001]
-        pos_constraint.constraint_region.primitive_poses.append(pose)
-        pos_constraint.weight = 1.0
-        orientation_constraint = OrientationConstraint() #orientation is fixed, can be adjusted if needed
-        orientation_constraint.header.frame_id = "world"
-        orientation_constraint.link_name = "end_effector_link"
-        orientation_constraint.orientation.x = 0.0
-        orientation_constraint.orientation.y = 0.0
-        orientation_constraint.orientation.z = 0.0
-        orientation_constraint.orientation.w = 1.0
-        orientation_constraint.absolute_x_axis_tolerance = 0.1
-        orientation_constraint.absolute_y_axis_tolerance = 0.1
-        orientation_constraint.absolute_z_axis_tolerance = 0.1
-        orientation_constraint.weight = 1.0
-        goal_msg.request.goal_constraints[0].orientation_constraints.append(orientation_constraint)
-        self._moveit_client.send_goal_async(goal_msg)
-
-
-
 
     def state_machine_callback(self):
         global sensor_reading
@@ -302,10 +334,27 @@ class KinovaActionNode(Node):
         #    return  # No detections yet
 
         if self.state == States.IDLE:
-            if self.transformed_pose is not None and self.grab_pressed:
-                self.state = States.APPROACHING
-                self.get_logger().info("Transitioning to APPROACHING state...")
-                self.grab_pressed = False  # Reset the flag
+            if self.state_transitioned:
+                self.get_logger().info("Idle state: waiting for object detection and grab command...")
+                self.state_transitioned = False  # Reset the flag after entering idle state
+                home_joints = self.predefined_poses['home']['joint']
+                traj_msg = JointTrajectory()
+                traj_msg.joint_names = [f'joint_{i+1}' for i in range(len(home_joints))]
+                point = JointTrajectoryPoint()
+                point.positions = home_joints
+                point.time_from_start = rclpy.duration.Duration(seconds=3).to_msg()
+                traj_msg.points.append(point)
+                self.robot_joint_publisher.publish(traj_msg)
+                self.clock = 0.0
+            else:
+                self.clock += 0.1  # Increment clock by timer period
+                if self.clock > 5.0:  # After 5 seconds in idle state, check for transition conditions
+                    if self.transformed_pose is not None and self.grab_pressed:
+                        self.state = States.GRABBING
+                        self.get_logger().info("Transitioning to GRABBING state...")
+                        self.grab_pressed = False  # Reset the flag
+                        self.clock = 0.0  # Reset clock for next state
+                        self.state_transitioned = True  # Set flag for next state
 
         if self.state == States.APPROACHING:
             if self.state_transitioned:
@@ -324,28 +373,62 @@ class KinovaActionNode(Node):
         if self.state == States.GRABBING:
             if self.state_transitioned:
                 self.get_logger().info("Grabbing the object...")
-                self.state_transitioned = False  # Reset the flag after grabbing
-                self.clock = 0.0  # Start counting time in grabbing state
-                self.action_client.wait_for_server()
-                goal_msg = SimpleMove.Goal()
-                goal_msg.target_pose = self.transformed_pose
-                goal_msg.target_pose.pose.position.z += 0.1  # Move down to the object
-                self.action_client.send_goal_async(goal_msg)
+                self.state_transitioned = False
+                self.grab_done = False
+                self.grab_succeeded = False
+                self.clock = 0.0
+                pick_msg = SimpleMove.Goal()
+                pick_msg.target_pose = self.transformed_pose.pose
+                pick_msg.target_pose.orientation.x = 0.0
+                pick_msg.target_pose.orientation.y = -0.707
+                pick_msg.target_pose.orientation.z = 0.0
+                pick_msg.target_pose.orientation.w = 0.707
+                pick_msg.move_gripper = 0
+                pick_msg.object_attached = False
+                send_goal_future = self.action_client.send_goal_async(
+                    pick_msg,
+                    feedback_callback=self.feedback_callback
+                )
+                send_goal_future.add_done_callback(self._on_grab_goal_response)
             else:
-                self.clock += 0.1  # Increment clock by timer period
-                if self.clock > 3.0:  # Close the gripper after 3 seconds in grabbing state
-                    #self.get_logger().info("Closing gripper to grab object...")
-                    self.gripper_command(1.0)  # 1 = close gripper
-                if self.clock > 5.0:  # After 5 seconds in grabbing state, transition to next state
-                    self.state = States.HOMEING
-                    self.state_transitioned = True  # Set flag for next state
-                    self.get_logger().info("Transitioning to HOMEING state...")
-                    self.clock = 0.0  # Reset clock for next state
-                # Implement grabbing logic here
+                if self.grab_done:
+                    self.clock += 0.1
+                    if self.grab_succeeded and self.clock > 2.0:  # brief wait for gripper to close
+                        self.state = States.HOMING
+                        self.state_transitioned = True
+                        self.get_logger().info("Transitioning to HOMING state...")
+                        self.clock = 0.0
+                    elif not self.grab_succeeded:
+                        self.state = States.IDLE
+                        self.state_transitioned = True
+                        self.get_logger().info("Grab failed, returning to IDLE state...")
+                        self.clock = 0.0
 
 
         if self.state == States.PLACING:
-            self.get_logger().info("Placing the object back...")
+            if self.state_transitioned:
+                self.get_logger().info("Placing the object back...")
+                self.state_transitioned = False  # Reset the flag after placing
+                self.clock = 0.0  # Start counting time in placing state
+                self.place_back_pressed = False  # Reset the flag
+                place_msg = JointTrajectory()
+                place_msg.joint_names = self.picked_joint_states.name[:-1]  # all but last joint
+                point = JointTrajectoryPoint()
+                point.positions = self.picked_joint_states.position[:-1]
+                point.time_from_start = rclpy.duration.Duration(seconds=3).to_msg()
+                place_msg.points.append(point)
+                self.get_logger().info(f"Placing back to joint states: {point.positions} with joint names: {place_msg.joint_names}")  # Print first 3 joint values for verification
+                self.robot_joint_publisher.publish(place_msg)  # Move back to the joint states at the moment of picking
+            else:
+                self.clock += 0.1  # Increment clock by timer period
+                if self.clock > 6.0:  # Open the gripper after 3 seconds in placing state
+                    #self.get_logger().info("Opening gripper to release object...")
+                    self.gripper_command(0.0)  # 0 = open gripper
+                if self.clock > 10.0:  # After 10 seconds in placing state, transition to next state
+                    self.state = States.IDLE
+                    self.state_transitioned = True  # Set flag for next state
+                    self.get_logger().info("Transitioning to IDLE state...")
+                    self.clock = 0.0  # Reset clock for next state
             # Implement placing logic here
 
         if self.state == States.HOMING:
@@ -357,7 +440,7 @@ class KinovaActionNode(Node):
                 traj_msg.joint_names = [f'joint_{i+1}' for i in range(len(home_joints))]
                 point = JointTrajectoryPoint()
                 point.positions = home_joints
-                point.time_from_start = rclpy.duration.Duration(seconds=2).to_msg()
+                point.time_from_start = rclpy.duration.Duration(seconds=3).to_msg()
                 traj_msg.points.append(point)
                 self.robot_joint_publisher.publish(traj_msg)
                 self.state_transitioned = False  # Reset the flag after homing
@@ -379,6 +462,12 @@ class KinovaActionNode(Node):
                         self.sniff_pressed = False  # Reset the flag
                         self.get_logger().info("Transitioning to SNIFFING state...")
                         self.clock = 0.0  # Reset clock for next state
+                    if self.place_back_pressed:
+                        self.state = States.PLACING
+                        self.state_transitioned = True  # Set flag for next state
+                        self.place_back_pressed = False  # Reset the flag
+                        self.get_logger().info("Transitioning to PLACING state...")
+                        self.clock = 0.0  # Reset clock for next state
         
 
         if self.state == States.POUCHING:
@@ -389,7 +478,7 @@ class KinovaActionNode(Node):
                 traj_msg.joint_names = [f'joint_{i+1}' for i in range(len(pouch_joints))]
                 point = JointTrajectoryPoint()
                 point.positions = pouch_joints
-                point.time_from_start = rclpy.duration.Duration(seconds=2).to_msg()
+                point.time_from_start = rclpy.duration.Duration(seconds=3).to_msg()
                 traj_msg.points.append(point)
                 self.robot_joint_publisher.publish(traj_msg)
                 self.state_transitioned = False  # Reset the flag after pouching
@@ -400,9 +489,9 @@ class KinovaActionNode(Node):
                     #self.get_logger().info("Opening gripper to release object into pouch...")
                     self.gripper_command(0.0)  # 0 = open gripper
                 if self.clock > 5.0:  # After 5 seconds in pouching state, transition to next state
-                    self.state = States.HOMING
+                    self.state = States.IDLE
                     self.state_transitioned = True  # Set flag for next state
-                    self.get_logger().info("Transitioning to HOMING state...")
+                    self.get_logger().info("Transitioning to IDLE state...")
                     self.clock = 0.0  # Reset clock for next state
 
         if self.state == States.SNIFFING:
@@ -412,7 +501,7 @@ class KinovaActionNode(Node):
                 traj_msg.joint_names = [f'joint_{i+1}' for i in range(len(sniff_joints))]
                 point = JointTrajectoryPoint()
                 point.positions = sniff_joints
-                point.time_from_start = rclpy.duration.Duration(seconds=2).to_msg()
+                point.time_from_start = rclpy.duration.Duration(seconds=3).to_msg()
                 traj_msg.points.append(point)
                 self.robot_joint_publisher.publish(traj_msg)
                 self.state_transitioned = False  # Reset the flag after sniffing
@@ -429,10 +518,6 @@ class KinovaActionNode(Node):
             self.get_logger().info("Spraying the object...")
             # Implement spraying logic here
 
-        if self.state == States.SNIFFING:
-            self.get_logger().info("Sniffing the object...")
-            # Implement sniffing logic here
-
 
 
         if self.state == States.NAVIGATING:
@@ -440,10 +525,34 @@ class KinovaActionNode(Node):
             # Implement navigation logic here
 
 
+    def feedback_callback(self, feedback):
+        pass
+
+    def _on_grab_goal_response(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().error("Grab goal rejected by action server.")
+            self.grab_done = True
+            self.grab_succeeded = False
+            return
+        goal_handle.get_result_async().add_done_callback(self._on_grab_result)
+
+    def _on_grab_result(self, future):
+        result = future.result()
+        self.grab_succeeded = result.result.success
+        self.grab_done = True
+        if self.grab_succeeded:
+            self.get_logger().info("Grab action succeeded.")
+            self.gripper_command(1.0)
+            self.picked_joint_states = self.latest_joint_states
+        else:
+            self.get_logger().error("Grab action failed.")
+
+
 
 def main(args=None):
     rclpy.init(args=args)
-    node = KinovaActionNode()
+    node = KinovaStateMachineNode()
     sensor_node = SensorReaderNode()
     executor = MultiThreadedExecutor()
     executor.add_node(node)
