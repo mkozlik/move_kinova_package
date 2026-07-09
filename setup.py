@@ -25,7 +25,9 @@ setup(
     entry_points={
         'console_scripts': [
             'move_kinova_node = move_kinova_package.move_kinova_node:main',
-            'move_kinova_service = move_kinova_package.move_kinova_service:main'
+            'move_kinova_service = move_kinova_package.move_kinova_service:main',
+            'move_kinova_action = move_kinova_package.move_kinova_action:main',
+            'move_kinova_state_machine = move_kinova_package.kinova_state_machine:main',
         ],
     },
 )

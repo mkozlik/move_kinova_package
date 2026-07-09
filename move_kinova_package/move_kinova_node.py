@@ -76,6 +76,56 @@ class KinovaBridge(Node):
         self.planning_scene_publisher.publish(planning_scene_msg)
         self.get_logger().info(f"Deleted object '{object_id}' from planning scene.")
 
+    async def _try_plan(self, goal_msg, pipeline_id, planner_id, label):
+        """Send `goal_msg` with the given planner. Returns the MoveGroup result
+        (with .status and .result.error_code) or None if MoveIt rejected the goal.
+
+        Mutates `goal_msg.request.pipeline_id` / `planner_id` so successive calls
+        can reuse the same goal_msg.
+        """
+        goal_msg.request.pipeline_id = pipeline_id
+        goal_msg.request.planner_id = planner_id
+        self.get_logger().info(
+            f"Planning attempt: {label} (pipeline={pipeline_id}, planner={planner_id})")
+
+        mg_handle = await self._moveit_client.send_goal_async(goal_msg)
+        if not mg_handle.accepted:
+            self.get_logger().warn(f"{label}: MoveIt rejected the goal")
+            return None
+        return await mg_handle.get_result_async()
+
+    async def _plan_with_fallback(self, goal_msg):
+        """Try Cartesian (Pilz LIN) -> PTP -> OMPL in order; return on first success."""
+        # Pilz LIN doesn't support path_constraints; stash and restore.
+        original_path_constraints = goal_msg.request.path_constraints
+
+        attempts = [
+            ("pilz_industrial_motion_planner", "LIN", "Cartesian (Pilz LIN)", False),
+            ("pilz_industrial_motion_planner", "PTP", "PTP (Pilz)",           False),
+            ("ompl",                            "",    "OMPL (default)",       True),
+        ]
+
+        for pipeline, planner, label, allow_path_constraints in attempts:
+            goal_msg.request.path_constraints = (
+                original_path_constraints if allow_path_constraints else Constraints()
+            )
+            result = await self._try_plan(goal_msg, pipeline, planner, label)
+            if result is None:
+                continue
+            if result.status == 4:  # SUCCEEDED
+                self.get_logger().info(f"{label} succeeded")
+                goal_msg.request.path_constraints = original_path_constraints
+                return result
+            try:
+                err = result.result.error_code.val
+            except AttributeError:
+                err = "?"
+            self.get_logger().warn(
+                f"{label} failed (status={result.status}, error_code={err})")
+
+        goal_msg.request.path_constraints = original_path_constraints
+        return None
+
     async def execute_callback(self, goal_handle):
         pos_x = 0.345
         pos_y = 0.0
@@ -118,18 +168,15 @@ class KinovaBridge(Node):
                 1.0,
                 name="target_object"
             )
-
         # 1. Wait for MoveIt
         if not self._moveit_client.wait_for_server(timeout_sec=5.0):
             goal_handle.abort()
             return SimpleMove.Result(success=False)
 
-        # 2. Build the complex MoveGroup goal
+        # 2. Build the common MoveGroup goal. pipeline_id / planner_id are
+        # filled in by _plan_with_fallback for each attempt.
         goal_msg = MoveGroup.Goal()
         goal_msg.request.group_name = "arm"
-
-        goal_msg.request.pipeline_id = "pilz_industrial_motion_planner"
-        goal_msg.request.planner_id = "PTP"
         goal_msg.request.max_velocity_scaling_factor = 0.7
         goal_msg.request.max_acceleration_scaling_factor = 0.7
 
@@ -213,23 +260,16 @@ class KinovaBridge(Node):
         goal_msg.request.num_planning_attempts = 30
         goal_msg.request.allowed_planning_time = 10.0
 
-        # 3. Send and Wait
-        self.get_logger().info("Sending goal to MoveIt...")
-        send_goal_future = await self._moveit_client.send_goal_async(goal_msg)
+        # 3. Plan with fallback: Cartesian (Pilz LIN) -> PTP -> OMPL.
+        self.get_logger().info("Planning motion (Cartesian -> PTP -> OMPL)")
+        move_result = await self._plan_with_fallback(goal_msg)
 
-        if not send_goal_future.accepted:
+        if move_result is None or move_result.status != 4:  # 4 = SUCCEEDED
+            self.get_logger().error("Arm motion failed: all planners exhausted.")
             goal_handle.abort()
             return SimpleMove.Result(success=False)
 
-        # Wait for arm motion result
-        move_result = await send_goal_future.get_result_async()
-
-        if move_result.status != 4:  # 4 = SUCCEEDED
-            self.get_logger().error("Arm motion failed.")
-            goal_handle.abort()
-            return SimpleMove.Result(success=False)
-
-        self.get_logger().info("Arm motion completed. Waiting 2 seconds...")
+        self.get_logger().info("Arm motion completed.")
         #await asyncio.sleep(2)
 
         # 4. Send Gripper Command
