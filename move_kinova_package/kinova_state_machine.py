@@ -160,6 +160,7 @@ class KinovaStateMachineNode(Node):
 
         # Storage for latest pose
         self.latest_pose = None
+        self.latest_centre_point = None
         self.latest_bbox_size = None
         self.transformed_pose = None
         self.picked_pose = None
@@ -258,6 +259,10 @@ class KinovaStateMachineNode(Node):
 
 
     def object_point_callback(self, msg: PointStamped):
+        # Dedicated store for the raw camera-frame centre point used by the
+        # base-alignment step. Keep it separate from latest_pose, which
+        # detection_callback overwrites with a PoseStamped.
+        self.latest_centre_point = msg
         self.latest_pose = msg
         try:
             # Transform the point to the robot's base frame but point itself cannot be tranformed, so we create a PoseStamped with the point as the position and a default orientation
@@ -442,7 +447,7 @@ class KinovaStateMachineNode(Node):
         Returns True once both axes have been driven for their planned time.
         """
         if not self._openloop_captured:
-            if self.latest_pose is None:
+            if self.latest_centre_point is None:
                 # Wait a short while for the first /centre_point_3d.
                 if self.clock > self.base_align_capture_timeout:
                     self.get_logger().warn(
@@ -456,8 +461,8 @@ class KinovaStateMachineNode(Node):
                     self._openloop_captured = True
                     self._openloop_start_clock = self.clock
                 return False
-            obj_x = float(self.latest_pose.point.x)
-            obj_z = float(self.latest_pose.point.z)
+            obj_x = float(self.latest_centre_point.point.x)
+            obj_z = float(self.latest_centre_point.point.z)
             disp_x = obj_x - self.base_target_x
             disp_z = obj_z - self.base_target_z
             speed = self.base_openloop_speed
